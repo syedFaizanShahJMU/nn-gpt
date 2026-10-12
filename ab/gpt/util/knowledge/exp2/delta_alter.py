@@ -2,7 +2,9 @@
 
 Separate from Experiment 1: new files only, outputs in their own folder, nothing existing is modified.
 Reuses (read-only) web_alter's network set, job pairing (same networks and seeds in both conditions),
-vLLM backend, and nn-gpt's extract_delta/apply_delta (as in the lab's delta NAS method).
+vLLM backend and nn-gpt's extract_delta. Diffs are applied STRICTLY (strict_apply): every hunk's old lines must
+match the code exactly and at exactly one place; line numbers are ignored. (nn-gpt's apply_delta, with patch fuzz
+and header re-normalisation, was observed to place a hunk silently at the wrong location.)
 Output layout is identical to web_alter, so run_eval_chunks / analyse_runs work unchanged.
 
 Per job:  delta prompt (+ web suggestions in the web condition) -> extract + apply diff
@@ -27,7 +29,6 @@ from pathlib import Path
 from ab.gpt.act.alter.web_alter import VLLMBackend, build_jobs, family, load_rows
 from ab.gpt.util.Const import new_nn_file, new_out_file
 from ab.gpt.util.Util import extract_delta
-from ab.gpt.util.nn.DeltaUtil import apply_delta
 
 REPO = Path(__file__).resolve().parents[5]
 
@@ -117,6 +118,57 @@ def smoke(code, row, workdir, timeout):
     return {"ok": False, "error": f"SmokeCrash: {tail[:400]}", "where": "", "infra": True}
 
 
+def parse_hunks(delta):
+    """Unified diff -> list of (old_lines, new_lines). Line numbers are ignored."""
+    hunks, old, new, in_hunk = [], [], [], False
+    for line in delta.splitlines():
+        if line.startswith("@@"):
+            if in_hunk and (old or new):
+                hunks.append((old, new))
+            old, new, in_hunk = [], [], True
+        elif not in_hunk or line.startswith(("--- ", "+++ ", "\\ No newline")):
+            continue
+        elif line.startswith("-"):
+            old.append(line[1:])
+        elif line.startswith("+"):
+            new.append(line[1:])
+        else:  # context; a blank line or a missing leading space is tolerated
+            ctx = line[1:] if line.startswith(" ") else line
+            old.append(ctx)
+            new.append(ctx)
+    if in_hunk and (old or new):
+        hunks.append((old, new))
+    return hunks
+
+
+def strict_apply(code, delta):
+    """Apply each hunk only where its old lines match exactly (ignoring trailing spaces) at exactly ONE place.
+    Returns (new_code, None) or (None, error message for the model)."""
+    hunks = parse_hunks(delta)
+    if not hunks:
+        return None, "no diff hunk (@@ ... @@) found in the answer"
+    lines = code.splitlines()
+    for k, (old, new) in enumerate(hunks, 1):
+        if not old:
+            return None, f"hunk {k} has no context or removed lines, so its position is unknown"
+        n = len(old)
+        pos = [i for i in range(len(lines) - n + 1)
+               if all(lines[i + j].rstrip() == old[j].rstrip() for j in range(n))]
+        if not pos:
+            bad = next((o for o in old if o.strip() and all(l.rstrip() != o.rstrip() for l in lines)), old[0])
+            return None, f"hunk {k}: its context/removed lines do not occur in the code (e.g. {bad.strip()[:80]!r})"
+        if len(pos) > 1:
+            return None, (f"hunk {k}: its context/removed lines match {len(pos)} places in the code; "
+                          "add more surrounding lines so the position is unique")
+        lines[pos[0]:pos[0] + n] = new
+    result = "\n".join(lines) + "\n"
+    try:
+        ast.parse(result)
+    except SyntaxError as e:
+        return None, f"the patched code has a syntax error at line {e.lineno}: {e.msg}"
+    return result, None
+
+
 def changed_lines(a, b):
     return sum(1 for l in difflib.unified_diff(a.splitlines(), b.splitlines(), lineterm="", n=0)
                if l[:1] in "+-" and not l.startswith(("+++", "---")))
@@ -139,10 +191,8 @@ def run_job(backend, job, out_dir, idx, max_repairs, smoke_timeout):
             break
         transcript.append({"round": rnd, "messages": msgs, "answer": out, "finish": finish})
         delta = extract_delta(out)
-        new = apply_delta(current, delta) if delta else None
+        new, err = strict_apply(current, delta) if delta else (None, "no diff found in the answer")
         if not new:
-            err = "no diff found in the answer" if not delta else \
-                "context or removed lines do not match the code exactly"
             attempts.append({"round": rnd, "stage": "apply", "ok": False, "error": err})
             msgs = msgs_for(fill(REPAIR_APPLY, ERR=err, CODE=current))
             continue
