@@ -145,7 +145,7 @@ def run_job(backend, job, out_dir, idx, a):
     row, base = job["row"], job["row"]["nn_code"]
     rec = dict(B=idx, nn=row["nn"], fam=family(row["nn"]), sample=job["k"], seed=job["seed"],
                extra_info=bool(job["extra"]))
-    extra = (d2.EXTRA_HEADER + job["extra"].strip() + "\n\n") if job["extra"] else ""
+    extra = (job.get("extra_header", d2.EXTRA_HEADER) + job["extra"].strip() + "\n\n") if job["extra"] else ""
     f = d2.FMT["whole"]
     budget = max(40, int(0.3 * len(base.splitlines())))
     msgs = d2.msgs_for(d2.fill(PROMPT, ACC=f"{float(row['accuracy']):.4f}", CODE=base, EXTRA=extra, BUDGET=budget,
