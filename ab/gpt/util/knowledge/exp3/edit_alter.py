@@ -12,6 +12,9 @@ Changes against Experiment 2 (all apply to BOTH conditions):
      off, return only the code") instead of the misleading "no code block found".
   3. The task states the 1-epoch goal explicitly (advisor: optimising for one epoch differs from optimising for
      many epochs; quickly trainable models win).
+  4. The repair message asks to fix the cause and forbids deleting error checks or disabling parts of the model
+     (observed in a MaxVit test: the model removed a `raise ValueError` instead of fixing its own change);
+     results record removed_checks = raise/assert statements lost against the original.
   OOM: the smoke check already treats CUDA out-of-memory as an infrastructure result (no repair round); the code is
   kept and goes to Eval.
 
@@ -61,10 +64,33 @@ parts) can beat a larger model that would need many epochs.
 @FMT_EXAMPLE@
 """
 
+REPAIR_RUN = """The model below fails when it is built and trained:
+
+<nn>
+@CODE@
+</nn>
+
+Error: @ERR@
+@WHERE@
+Fix the CAUSE of this error with a minimal change to THIS code exactly as shown. Never delete or weaken error \
+checks (raise, assert) and never disable parts of the model just to make the error disappear; if one of your own \
+changes caused the error, adjust or undo that change. Keep the other intended architecture changes; do not change \
+supported_hyperparameters, train_setup or learn unless the error is there; never add new prm keys; define or import \
+every name you use. @OUT@
+"""
+
 REPAIR_TRUNC = """Your answer was cut off because it was too long: the closing </nn> tag is missing. \
 Reply again with ONLY the complete modified code inside <nn></nn> tags, with no explanation before or after it. \
 Never omit or abbreviate any part of the code.
 """
+
+
+def n_checks(code):
+    """Number of raise/assert statements (to measure whether repairs remove error checks)."""
+    try:
+        return sum(isinstance(x, (ast.Raise, ast.Assert)) for x in ast.walk(ast.parse(code)))
+    except SyntaxError:
+        return 0
 
 
 class ContextFull(Exception):
@@ -150,7 +176,7 @@ def run_job(backend, job, out_dir, idx, a):
         if res.get("ok") or res.get("infra"):
             break
         where = f"Location: {res['where']}\n" if res.get("where") else ""
-        msgs = msgs + [{"role": "user", "content": d2.fill(d2.REPAIR_RUN, CODE=current, ERR=res["error"], WHERE=where,
+        msgs = msgs + [{"role": "user", "content": d2.fill(REPAIR_RUN, CODE=current, ERR=res["error"], WHERE=where,
                                                            OUT=f["out"])}]
     smokes = [x for x in attempts if x["stage"] == "smoke"]
     parses = False
@@ -176,6 +202,7 @@ def run_job(backend, job, out_dir, idx, a):
                finish=[t["finish"] for t in transcript],
                smoke_first=smokes[0].get("ok") if smokes else None, smoke_last=smokes[-1].get("ok") if smokes else None,
                smoke_infra=any(x.get("infra") for x in smokes),
+               removed_checks=max(0, n_checks(base) - n_checks(code)) if code else None,
                changed_lines=d2.changed_lines(base, code) if code else None, seconds=round(time.time() - t0, 1))
     return rec
 
@@ -225,7 +252,7 @@ def main():
         commit = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=REPO, text=True).strip()
     except Exception:
         commit = "unknown"
-    prompts_md5 = hashlib.md5((d2.SYSTEM + PROMPT + d2.EXTRA_HEADER + d2.REPAIR_RUN + d2.REPAIR_APPLY + REPAIR_TRUNC
+    prompts_md5 = hashlib.md5((d2.SYSTEM + PROMPT + d2.EXTRA_HEADER + REPAIR_RUN + d2.REPAIR_APPLY + REPAIR_TRUNC
                                + json.dumps(d2.FMT["whole"])).encode()).hexdigest()
     meta = dict(vars(a), experiment="exp3-base-v3", condition=cond, backend=backend.name, nn_gpt_commit=commit,
                 nn_dataset=version("nn-dataset"), prompts_md5=prompts_md5, networks=len({j["row"]["nn"] for j in jobs}), jobs=len(jobs),
