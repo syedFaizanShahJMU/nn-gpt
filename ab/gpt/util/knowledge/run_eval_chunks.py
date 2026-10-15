@@ -5,6 +5,9 @@ or reboot loses everything evaluated so far. This driver calls Eval on chunks of
 (symlinked into RUN_DIR/_eval_chunk), skips folders that already have a result (resumable), and
 waits until a run's generation has finished before evaluating it.
 A folder that still has no result after 2 Eval attempts gets error.txt "EvalNoResultError".
+--wait_gpu_mib N (default 0 = off): before each chunk, wait until no process on the GPU uses more than N MiB
+(another lab job filled the shared GPU during Experiment 3 and caused 11 out-of-memory failures, E38). Waits are
+logged in RUN_DIR/gpu_waits.log.
 
 Usage: python -m ab.gpt.util.knowledge.run_eval_chunks RUN_DIR [RUN_DIR ...] [--chunk 10]
 """
@@ -31,6 +34,33 @@ def generation_finished(run):
     return res.exists() and len(res.read_text().splitlines()) >= jobs
 
 
+def busy_gpu(limit_mib):
+    """Processes on the GPU above limit_mib MiB (none of ours runs between chunks)."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=60).stdout
+    except Exception:  # no nvidia-smi: do not block
+        return []
+    busy = []
+    for line in out.splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) > limit_mib:
+            busy.append(f"{parts[0]} {parts[1]}")
+    return busy
+
+
+def wait_for_gpu(run, limit_mib, every=600):
+    while True:
+        busy = busy_gpu(limit_mib)
+        if not busy:
+            return
+        msg = f"GPU busy (pid, MiB: {'; '.join(busy)}), waiting {every // 60} min"
+        log(f"{run.name}: {msg}")
+        with open(run / "gpu_waits.log", "a") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+        time.sleep(every)
+
+
 def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
@@ -39,6 +69,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("runs", nargs="+")
     p.add_argument("--chunk", type=int, default=10)
+    p.add_argument("--wait_gpu_mib", type=int, default=0, help="0 = off; else wait while another process uses more")
     a = p.parse_args()
     for run in map(Path, a.runs):
         while not generation_finished(run):
@@ -54,6 +85,8 @@ def main():
             todo = [d for d in todo if attempts.get(d.name, 0) < 2]
             if not todo:
                 break
+            if a.wait_gpu_mib:
+                wait_for_gpu(run, a.wait_gpu_mib)
             chunk = todo[:a.chunk]
             cdir = run / "_eval_chunk"
             shutil.rmtree(cdir, ignore_errors=True)  # removes only the symlinks, never the targets
